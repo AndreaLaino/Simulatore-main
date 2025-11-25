@@ -12,7 +12,7 @@ import pandas as pd
 
 from sensor import sensors
 from read import read_sensors
-import smartmeter  # funzioni di lettura reale
+import smartmeter 
 import json
 import dhtlogger
 
@@ -58,19 +58,18 @@ def _load_sensor_map(path="sensor_map.json") -> dict:
     return {}
 
 def _dual_plot_temperature(ax, sensor: str, sensor_data: dict):
-    # --- simulato
+    # --- simulated
     time_list = sensor_data.get('time', [])
-    y_sim = sensor_data.get('state', [])  # per il tuo Temperature i valori sono in 'state'
+    y_sim = sensor_data.get('state', []) 
     df_sim = _build_dataframe(time_list, y_sim) if (time_list and y_sim) else pd.DataFrame()
 
-    # --- reale: preferiamo leggere per LABEL (=nome sensore)
+    # --- real
     df_real = dhtlogger.load_temp_by_label_any_csv(sensor, logs_dir="logs")
 
     if df_sim.empty and df_real.empty:
         ax.text(0.5, 0.5, "Nessun dato (sim/reale) per Temperature", ha="center", va="center", transform=ax.transAxes)
         return None, "Temperature (°C)"
 
-    # allineo il reale alla stessa giornata del simulato (o 1900-01-01)
     ref_day = (df_sim.index[0].date() if not df_sim.empty else date(1900,1,1))
     if not df_real.empty:
         df_real = df_real.copy()
