@@ -9,11 +9,24 @@ from common import active_cycles
 from consumption_profiles import get_device_consumption, consumption_profiles
 from read import read_sensors as sensors_file
 from read import read_devices as devices_file
-
+import os, json
+from dhtlogger import load_temp_by_label_any_csv, load_temp_by_gpio_any_csv
 
 sensors = []
 add_point_enabled = False
 
+SENSOR_MAP_PATH = "sensor_map.json"
+
+
+def _load_sensor_map(path: str = SENSOR_MAP_PATH) -> dict:
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[WARN] cannot load {path}: {e}")
+    return {}
 
 def get_sensor_params(sensor_type):
     params = {
@@ -104,14 +117,91 @@ def changePIR(canvas, sensor, sensors, new_state=None):
     return name, new_state, updated_sensors
 
 
-# Stub: qui puoi implementare la lettura reale dal CSV
-def get_last_real_temperature(sensor_name: str, n: int):
+def get_last_real_temperature(sensor_name: str, window_minutes: int = 10):
     """
-    Ritorna la temperatura reale filtrata (media degli ultimi n valori).
-    Per ora è uno stub che restituisce None.
+    Ritorna la media degli ultimi 'window_minutes' minuti di temperatura reale
+    per il sensore loggato DHT associato a 'sensor_name'.
+    Usa prima il mapping by 'dht' (gpio), poi fallback per label.
     """
-    return None
+    if not sensor_name:
+        return None
 
+    mapping = _load_sensor_map()
+    cfg = mapping.get(sensor_name, {})
+
+    df = None
+
+    # 1) se è associato a DHT via GPIO, prova per gpio
+    if isinstance(cfg, dict) and cfg.get("by") == "dht":
+        gpio = cfg.get("gpio")
+        if gpio is not None:
+            try:
+                df = load_temp_by_gpio_any_csv(int(gpio))
+            except Exception as e:
+                print(f"[WARN] load_temp_by_gpio_any_csv failed for {sensor_name}: {e}")
+
+    # 2) fallback: cerca CSV per label
+    if df is None or df.empty:
+        try:
+            df = load_temp_by_label_any_csv(sensor_name)
+        except Exception as e:
+            print(f"[WARN] load_temp_by_label_any_csv failed for {sensor_name}: {e}")
+            df = None
+
+    if df is None or df.empty or "value" not in df.columns:
+        return None
+
+    # df è già a risoluzione 1 minuto: prendo gli ultimi 'window_minutes' punti
+    last = df.tail(window_minutes)
+    if last.empty:
+        return None
+
+    try:
+        return float(last["value"].mean())
+    except Exception:
+        return None
+    
+def infer_room_state(sensor_name: str, window_minutes: int = 20) -> str:
+    """
+    Analizza la temperatura negli ultimi 'window_minutes' minuti e prova a
+    classificare lo stato della stanza: heating / cooling / cooking / stable.
+    """
+    if not sensor_name:
+        return "unknown"
+
+    mapping = _load_sensor_map()
+    cfg = mapping.get(sensor_name, {})
+
+    df = None
+    if isinstance(cfg, dict) and cfg.get("by") == "dht":
+        gpio = cfg.get("gpio")
+        if gpio is not None:
+            df = load_temp_by_gpio_any_csv(int(gpio))
+
+    if df is None or df.empty:
+        df = load_temp_by_label_any_csv(sensor_name)
+
+    if df is None or df.empty or "value" not in df.columns:
+        return "unknown"
+
+    tail = df.tail(window_minutes)
+    if len(tail) < 2:
+        return "unknown"
+
+    t0 = float(tail["value"].iloc[0])
+    t1 = float(tail["value"].iloc[-1])
+    delta = t1 - t0
+    slope = delta / max(1, len(tail) - 1)  # °C per minuto (circa)
+
+    # Soglie molto empiriche: le aggiusti tu dopo aver visto i dati reali
+    if slope > 0.15 and t1 >= 26:
+        return "cooking"      # sale tanto ed è già calda
+    elif slope > 0.05:
+        return "heating"      # sta aumentando
+    elif slope < -0.05:
+        return "cooling"      # sta scendendo
+    else:
+        return "stable"
 
 def changeTemperature(canvas, sensor, sensors, heating_factor, delta_seconds):
     if len(sensor) != 11:
@@ -129,32 +219,29 @@ def changeTemperature(canvas, sensor, sensors, heating_factor, delta_seconds):
         state,
         direction,
         consumption,
-        associated_device,
+        associated_device,   # qui non lo usiamo per DHT, il binding è in sensor_map.json
     ) = sensor
 
-    # ---- PARAMETRI BASE ----
     min_val = float(min_val)
     max_val = float(max_val)
     step = float(step)
     current_state = float(state)
 
-    # ---- NUOVO VALORE REALE FILTRATO ----
-    # Media ultimi 3 valori dal CSV, se esiste
-    real_target = get_last_real_temperature(name, 3)
+    # ---- TARGET REALE DAL CSV (se associato in sensor_map.json) ----
+    real_target = get_last_real_temperature(name, window_minutes=10)
 
-    # ---- TARGET DELLA SIMULAZIONE ----
     if real_target is not None:
-        # Clip ai limiti del sensore
+        # clamp ai limiti sensore
         real_target = max(min_val, min(max_val, real_target))
         target = real_target
     else:
-        # segue riscaldamento classico
         target = None
 
-    # ---- MOVIMENTO GRADUALE (0.02°C A MIN SIMULATO) ----
-    change_speed = 0.02 * delta_seconds  # proporzionale al tempo simulato
+    # ---- velocità di cambiamento (°C per minuto simulato) ----
+    change_speed = 0.02 * delta_seconds  # molto dolce
 
     if target is not None:
+        # Mi avvicino lentamente alla temperatura reale
         if abs(current_state - target) < change_speed:
             new_state = target
         elif current_state < target:
@@ -162,19 +249,16 @@ def changeTemperature(canvas, sensor, sensors, heating_factor, delta_seconds):
         else:
             new_state = current_state - change_speed
     else:
-        # Comportamento normale quando non c'è input reale
+        # Niente dati reali → comportamento simulato "classico"
         if heating_factor > 0:
-            new_state = min(
-                current_state + (step * delta_seconds * heating_factor),
-                max_val,
-            )
+            new_state = min(current_state + (step * delta_seconds * heating_factor), max_val)
         else:
             new_state = max(current_state - (step * delta_seconds), min_val)
 
-    # ---- ARROTONDAMENTO ----
+    # Arrotonda a mezzi gradi
     new_state = round(new_state * 2) / 2.0
 
-    # ---- AGGIORNA ARRAY SENSORI ----
+    # Aggiorna lista sensori
     updated = []
     for s in sensors:
         if s == sensor:
@@ -196,11 +280,10 @@ def changeTemperature(canvas, sensor, sensors, heating_factor, delta_seconds):
         else:
             updated.append(s)
 
-    # ---- AGGIORNA COLORE ----
+    # aggiorna colore
     update_sensor_color(canvas, name, new_state, min_val)
 
     return name, new_state, updated
-
 
 def changeSmartMeter(canvas, sensor, sensors, devices, delta_seconds, current_datetime):
     if len(sensor) < 11:
@@ -416,11 +499,16 @@ class SensorDialog(simpledialog.Dialog):
             direction = float(self.direction_entry.get())
             params["direction"] = direction
 
-        associated_device = (
-            self.associated_device_combobox.get()
-            if type == "Smart Meter"
-            else None
-        )
+        associated_device = None
+
+        if type == "Smart Meter":
+            associated_device = self.associated_device_combobox.get()
+
+        if type == "Temperature":
+            # se esiste un logger DHT associato, provo a leggere il valore iniziale
+            real_temp = get_last_real_temperature(name, window_minutes=10)
+            if real_temp is not None:
+                params["state"] = max(params["min"], min(params["max"], real_temp))
 
         self.result = (
             name,
